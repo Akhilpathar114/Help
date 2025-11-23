@@ -439,66 +439,117 @@ def main():
                 st.error(f"Failed to read CSV: {e}")
                 st.stop()
         st.sidebar.success("CSV loaded.")
-        # --- DATA SANITIZE (paste here, inside main(), right after CSV load) ---
+        # --- STRONGER DATA SANITIZER (replace previous sanitizer) ---
 import re
 
-def sanitize_dataframe_for_cellguard(df):
+def strong_sanitize_df_for_cellguard(df):
+    """
+    Aggressively clean df in-place and return cleaned copy.
+    - Force-convert known columns to numeric
+    - Remove additional header rows (rows containing column names repeated)
+    - Strip units like 'V', 'A', '%' and commas
+    - Report up to 50 offending unique strings per numeric column
+    - Fill NaNs with median / forward-fill to keep downstream aggregations safe
+    """
+    df = df.copy()
     st.write("### Raw sample (first 6 rows)")
     st.write(df.head(6))
     st.write("### Raw dtypes")
     st.write(df.dtypes)
 
-    df.columns = [c.strip() for c in df.columns]
+    # Strip whitespace from column names
+    df.columns = [str(c).strip() for c in df.columns]
 
-    likely_numeric_names = ['voltage','current','temp','temperature','soc','soc%', 'soc_perc', 'power', 'energy', 'capacity', 'cell_voltage']
-    numeric_cols = []
-    for c in df.columns:
-        cname = c.lower()
-        if any(k in cname for k in likely_numeric_names):
-            numeric_cols.append(c)
+    # Quick heuristic: remove rows that look like repeated header rows
+    # (a row where many cells equal column names)
+    def is_header_like(row):
+        cnt = 0
+        for col in df.columns:
+            try:
+                if str(row.get(col, "")).strip().lower() == str(col).strip().lower():
+                    cnt += 1
+            except Exception:
+                pass
+        return cnt >= max(2, len(df.columns)//4)  # if many matches, treat as header
+    header_mask = df.apply(is_header_like, axis=1)
+    if header_mask.any():
+        st.warning(f"Removed {header_mask.sum()} header-like rows that looked like repeated headings.")
+        df = df.loc[~header_mask].reset_index(drop=True)
 
-    for c in df.columns:
-        if c in numeric_cols:
-            continue
-        parsed = pd.to_numeric(df[c].astype(str).replace(',', '', regex=True), errors='coerce')
-        frac_numeric = parsed.notna().mean()
-        if frac_numeric > 0.7:
-            numeric_cols.append(c)
+    # columns we care about (force these numeric)
+    force_numeric = ["voltage","current","temperature","temp","soc","cycle","time"]
+    # normalize column names to lowercase for matching
+    col_map_lower = {c.lower(): c for c in df.columns}
+    mapped = {}
+    for want in force_numeric:
+        for cname_lower, orig in col_map_lower.items():
+            if want in cname_lower or any(k in cname_lower for k in ["volt","vcell","packv"]) and "volt" in want:
+                # match examples like "Voltage (V)" , "current_A", "Temp_C"
+                if want not in mapped:
+                    mapped[want] = orig
 
-    st.write("Identified numeric columns:", numeric_cols)
+    # also try to map standard names using your normalize function if present
+    # fallback: if exact name exists, use it
+    for core in ["voltage","current","temperature","soc","cycle","time"]:
+        if core in df.columns and core not in mapped:
+            mapped[core] = core
 
-    def clean_numeric_str(s):
+    st.write("Column mapping (for force-numeric):", mapped)
+
+    # cleaning function for numeric-like strings
+    def clean_num_str(s):
         if pd.isnull(s):
             return s
         s = str(s).strip()
-        s = re.sub(r'\s*[A-Za-z%]+$', '', s)
+        # remove currency, percent, units at end (like ' V', 'A', '%', 'degC')
+        s = re.sub(r'(?i)\b(v|volts?|a|amps?|%|degc|c|khz|hz|mv|ma)\b', '', s)
+        # remove stray text in parentheses
+        s = re.sub(r'\(.*?\)', '', s)
+        # remove non-digit characters except dot, minus, exponent and comma
+        s = re.sub(r'[^\d\.\-eE,]+', '', s)
+        # remove commas used as thousands separators
         s = s.replace(',', '')
-        return s
+        s = s.strip()
+        return s if s != '' else None
 
-    for c in numeric_cols:
-        df[c + '_raw_before'] = df[c]
-        cleaned = df[c].map(clean_numeric_str)
-        df[c] = pd.to_numeric(cleaned, errors='coerce')
+    # For each mapped numeric column, coerce and report failures
+    for key, orig_col in mapped.items():
+        try:
+            raw_series = df[orig_col].astype(object)
+        except Exception:
+            continue
 
-        mask_bad = df[c].isna() & df[c + '_raw_before'].notna()
-        if mask_bad.any():
-            st.write(f"Non-numeric entries found in column `{c}` (showing up to 10 unique):")
-            st.write(df.loc[mask_bad, c + '_raw_before'].unique()[:10])
+        cleaned = raw_series.map(clean_num_str)
+        coerced = pd.to_numeric(cleaned, errors='coerce')
 
-    for c in list(df.columns):
-        if c.endswith('_raw_before'):
-            df.drop(columns=[c], inplace=True)
+        # Report offending unique strings (where original existed but conversion failed)
+        bad_mask = coerced.isna() & raw_series.notna()
+        if bad_mask.any():
+            bad_vals = raw_series[bad_mask].astype(str).unique()[:50]
+            st.write(f"Non-numeric examples in column `{orig_col}` (showing up to 50):")
+            st.write(list(bad_vals))
 
-    st.write("### Cleaned dtypes")
+        # Replace column in df with coerced numeric
+        df[orig_col] = coerced
+
+        # Fill NaNs with median (if numeric) else forward-fill, then back-fill as last resort
+        if df[orig_col].notna().sum() > 0:
+            median = df[orig_col].median(skipna=True)
+            df[orig_col] = df[orig_col].fillna(median).ffill().bfill()
+        else:
+            # nothing numeric — set to NaN (will be handled downstream)
+            df[orig_col] = df[orig_col].astype(float)
+
+    st.write("### After force-conversion dtypes")
     st.write(df.dtypes)
-    st.write("### Cleaned sample")
+    st.write("### Cleaned sample (first 6 rows)")
     st.write(df.head(6))
-
     return df
 
-# apply sanitizer to uploaded CSV
-df_raw = sanitize_dataframe_for_cellguard(df_raw)
-# --- END SANITIZE ---
+# Apply the stronger sanitizer to uploaded CSV
+df_raw = strong_sanitize_df_for_cellguard(df_raw)
+# --- END STRONG SANITIZER ---
+        
 
     # Normalize and feature engineering
     df_raw, col_map = normalize_bms_columns(df_raw)
