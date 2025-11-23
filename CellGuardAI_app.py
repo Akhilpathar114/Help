@@ -439,6 +439,66 @@ def main():
                 st.error(f"Failed to read CSV: {e}")
                 st.stop()
         st.sidebar.success("CSV loaded.")
+        # --- DATA SANITIZE (paste here, inside main(), right after CSV load) ---
+import re
+
+def sanitize_dataframe_for_cellguard(df):
+    st.write("### Raw sample (first 6 rows)")
+    st.write(df.head(6))
+    st.write("### Raw dtypes")
+    st.write(df.dtypes)
+
+    df.columns = [c.strip() for c in df.columns]
+
+    likely_numeric_names = ['voltage','current','temp','temperature','soc','soc%', 'soc_perc', 'power', 'energy', 'capacity', 'cell_voltage']
+    numeric_cols = []
+    for c in df.columns:
+        cname = c.lower()
+        if any(k in cname for k in likely_numeric_names):
+            numeric_cols.append(c)
+
+    for c in df.columns:
+        if c in numeric_cols:
+            continue
+        parsed = pd.to_numeric(df[c].astype(str).replace(',', '', regex=True), errors='coerce')
+        frac_numeric = parsed.notna().mean()
+        if frac_numeric > 0.7:
+            numeric_cols.append(c)
+
+    st.write("Identified numeric columns:", numeric_cols)
+
+    def clean_numeric_str(s):
+        if pd.isnull(s):
+            return s
+        s = str(s).strip()
+        s = re.sub(r'\s*[A-Za-z%]+$', '', s)
+        s = s.replace(',', '')
+        return s
+
+    for c in numeric_cols:
+        df[c + '_raw_before'] = df[c]
+        cleaned = df[c].map(clean_numeric_str)
+        df[c] = pd.to_numeric(cleaned, errors='coerce')
+
+        mask_bad = df[c].isna() & df[c + '_raw_before'].notna()
+        if mask_bad.any():
+            st.write(f"Non-numeric entries found in column `{c}` (showing up to 10 unique):")
+            st.write(df.loc[mask_bad, c + '_raw_before'].unique()[:10])
+
+    for c in list(df.columns):
+        if c.endswith('_raw_before'):
+            df.drop(columns=[c], inplace=True)
+
+    st.write("### Cleaned dtypes")
+    st.write(df.dtypes)
+    st.write("### Cleaned sample")
+    st.write(df.head(6))
+
+    return df
+
+# apply sanitizer to uploaded CSV
+df_raw = sanitize_dataframe_for_cellguard(df_raw)
+# --- END SANITIZE ---
 
     # Normalize and feature engineering
     df_raw, col_map = normalize_bms_columns(df_raw)
